@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>to_podcast</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.5rem; }
+    input, button { padding: .5rem .8rem; font-size: 1rem; }
+    input { width: 100%; box-sizing: border-box; margin-bottom: .5rem; }
+    button { cursor: pointer; }
+    #status { margin-top: 1rem; padding: .5rem; border-radius: 4px; }
+    .ok  { background:#d4edda; color:#155724; }
+    .err { background:#f8d7da; color:#721c24; }
+    .info{ background:#d1ecf1; color:#0c5460; }
+    #app-section { display:none; }
+    #episodes { margin-top:1.5rem; }
+    .ep { border:1px solid #ccc; border-radius:4px; padding:.6rem; margin:.4rem 0; }
+  </style>
+</head>
+<body>
+  <h1>to_podcast</h1>
+
+  <!-- Auth section -->
+  <section id="auth-section">
+    <label>Username<br>
+      <input id="username" type="text" placeholder="your username" autocomplete="username webauthn">
+    </label>
+    <div style="margin-top:.5rem; display:flex; gap:.5rem;">
+      <button onclick="registerPasskey()">Register passkey</button>
+      <button onclick="loginPasskey()">Sign in with passkey</button>
+    </div>
+  </section>
+
+  <!-- Logged-in section -->
+  <section id="app-section">
+    <p>Signed in. <button onclick="signOut()">Sign out</button></p>
+    <h2>Submit a URL</h2>
+    <input id="video-url" type="url" placeholder="https://www.youtube.com/watch?v=…">
+    <button onclick="submitUrl()">Extract audio &amp; add to feed</button>
+    <h2>RSS feed</h2>
+    <p>Subscribe your podcast app to: <code id="feed-url"></code></p>
+    <div id="episodes"></div>
+  </section>
+
+  <div id="status"></div>
+
+<script>
+// ---- base64url helpers ----
+function b64uDecode(b64u) {
+  const b64 = b64u.replace(/-/g,'+').replace(/_/g,'/');
+  const pad = b64 + '='.repeat((4 - b64.length % 4) % 4);
+  return Uint8Array.from(atob(pad), c => c.charCodeAt(0));
+}
+function b64uEncode(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+
+function credToJSON(c) {
+  const r = { id: c.id, rawId: b64uEncode(c.rawId), type: c.type, response: {} };
+  if (c.response.attestationObject) {
+    r.response.attestationObject = b64uEncode(c.response.attestationObject);
+    r.response.clientDataJSON     = b64uEncode(c.response.clientDataJSON);
+    if (c.response.getTransports) r.response.transports = c.response.getTransports();
+  } else {
+    r.response.authenticatorData = b64uEncode(c.response.authenticatorData);
+    r.response.clientDataJSON    = b64uEncode(c.response.clientDataJSON);
+    r.response.signature         = b64uEncode(c.response.signature);
+    if (c.response.userHandle)
+      r.response.userHandle = b64uEncode(c.response.userHandle);
+  }
+  return r;
+}
+
+function prepareCreate(ccr) {
+  const pk = ccr.publicKey;
+  return {
+    ...pk,
+    challenge: b64uDecode(pk.challenge),
+    user: { ...pk.user, id: b64uDecode(pk.user.id) },
+    excludeCredentials: (pk.excludeCredentials||[]).map(c=>({...c, id:b64uDecode(c.id)})),
+  };
+}
+
+function prepareGet(rcr) {
+  const pk = rcr.publicKey;
+  return {
+    ...pk,
+    challenge: b64uDecode(pk.challenge),
+    allowCredentials: (pk.allowCredentials||[]).map(c=>({...c, id:b64uDecode(c.id)})),
+  };
+}
+
+// ---- UI helpers ----
+let sessionToken = null;
+
+function setStatus(msg, type='info') {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = type;
+}
+
+function showApp() {
+  document.getElementById('auth-section').style.display = 'none';
+  document.getElementById('app-section').style.display = '';
+  document.getElementById('feed-url').textContent = window.location.origin + '/feed.rss';
+}
+
+function signOut() {
+  sessionToken = null;
+  document.getElementById('auth-section').style.display = '';
+  document.getElementById('app-section').style.display = 'none';
+  setStatus('Signed out.', 'info');
+}
+
+// ---- WebAuthn flows ----
+async function registerPasskey() {
+  const username = document.getElementById('username').value.trim();
+  if (!username) { setStatus('Enter a username first.', 'err'); return; }
+  try {
+    const startRes = await fetch('/api/webauthn/register/start', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username})
+    });
+    if (!startRes.ok) throw new Error(await startRes.text());
+    const ccr = await startRes.json();
+
+    const credential = await navigator.credentials.create({ publicKey: prepareCreate(ccr) });
+
+    const finishRes = await fetch('/api/webauthn/register/finish', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ username, credential: credToJSON(credential) })
+    });
+    if (!finishRes.ok) throw new Error(await finishRes.text());
+    setStatus('Passkey registered! You can now sign in.', 'ok');
+  } catch (e) { setStatus('Registration failed: ' + e.message, 'err'); }
+}
+
+async function loginPasskey() {
+  const username = document.getElementById('username').value.trim();
+  if (!username) { setStatus('Enter a username first.', 'err'); return; }
+  try {
+    const startRes = await fetch('/api/webauthn/auth/start', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username})
+    });
+    if (!startRes.ok) throw new Error(await startRes.text());
+    const rcr = await startRes.json();
+
+    const assertion = await navigator.credentials.get({ publicKey: prepareGet(rcr) });
+
+    const finishRes = await fetch('/api/webauthn/auth/finish', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ username, credential: credToJSON(assertion) })
+    });
+    if (!finishRes.ok) throw new Error(await finishRes.text());
+    const { token } = await finishRes.json();
+    sessionToken = token;
+    setStatus('Signed in!', 'ok');
+    showApp();
+  } catch (e) { setStatus('Sign-in failed: ' + e.message, 'err'); }
+}
+
+// ---- Submit URL ----
+async function submitUrl() {
+  const url = document.getElementById('video-url').value.trim();
+  if (!url) { setStatus('Paste a URL first.', 'err'); return; }
+  try {
+    const res = await fetch('/api/submit', {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer '+sessionToken },
+      body: JSON.stringify({url})
+    });
+    if (!res.ok) throw new Error(await res.text());
+    setStatus('Queued! Audio extraction may take a minute.', 'ok');
+    document.getElementById('video-url').value = '';
+  } catch(e) { setStatus('Submit failed: ' + e.message, 'err'); }
+}
+</script>
+</body>
+</html>
