@@ -61,6 +61,32 @@ fn vimeo_id_from_url(url: &str) -> Option<String> {
     re.captures(url).map(|c| c[1].to_string())
 }
 
+/// If `url` is itself a Vimeo video URL, return `(video_id, optional_hash)`.
+/// This covers both `vimeo.com/ID` and `player.vimeo.com/video/ID[?h=HASH]`.
+/// Returns `None` for any non-Vimeo URL.
+pub fn extract_vimeo_from_direct_url(url: &str) -> Option<(String, Option<String>)> {
+    let parsed = Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+
+    // Only match proper https/http Vimeo domains
+    if !matches!(host, "vimeo.com" | "www.vimeo.com" | "player.vimeo.com") {
+        return None;
+    }
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+
+    let id = vimeo_id_from_url(url)?;
+
+    // Extract the ?h= hash used for private/unlisted videos
+    let hash = parsed
+        .query_pairs()
+        .find(|(k, _)| k == "h")
+        .map(|(_, v)| v.into_owned());
+
+    Some((id, hash))
+}
+
 // ── Vimeo config JSON parsing ─────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -135,8 +161,11 @@ async fn fetch_html(url: &str) -> Result<String> {
     resp.text().await.context("Failed to read response body")
 }
 
-async fn fetch_vimeo_stream(video_id: &str) -> Result<VimeoStream> {
-    let config_url = format!("https://player.vimeo.com/video/{}/config", video_id);
+async fn fetch_vimeo_stream(video_id: &str, hash: Option<&str>) -> Result<VimeoStream> {
+    let mut config_url = format!("https://player.vimeo.com/video/{}/config", video_id);
+    if let Some(h) = hash {
+        config_url.push_str(&format!("?h={}", h));
+    }
     let client = http_client().await?;
     let resp = client
         .get(&config_url)
@@ -222,16 +251,29 @@ async fn probe_duration(path: &Path) -> Option<u32> {
 
 // ── Public async entry point ──────────────────────────────────────────────────
 
-/// Fetch `page_url`, locate the embedded Vimeo video, extract its audio to
-/// `output_dir`, and return an `AudioFile` with the mp3 path and metadata.
-pub async fn process_url(page_url: &str, output_dir: &Path) -> Result<AudioFile> {
-    validate_url(page_url)?;
+/// Process a URL: either a direct Vimeo URL or a page that embeds Vimeo.
+///
+/// Accepted URL forms:
+/// - `https://vimeo.com/123456789` — direct Vimeo video
+/// - `https://player.vimeo.com/video/123456789[?h=HASH]` — player URL (private/unlisted)
+/// - Any other http(s) URL — fetched as a page; must contain a Vimeo `<iframe>`
+pub async fn process_url(input_url: &str, output_dir: &Path) -> Result<AudioFile> {
+    validate_url(input_url)?;
 
-    let html = fetch_html(page_url).await?;
-    let video_id = extract_vimeo_id_from_page(&html)
-        .context("No Vimeo embed found on that page")?;
+    let stream = if let Some((id, hash)) = extract_vimeo_from_direct_url(input_url) {
+        // Skip page fetch — resolve the stream directly
+        fetch_vimeo_stream(&id, hash.as_deref()).await?
+    } else {
+        // Fetch the page and look for an embedded Vimeo iframe
+        let html = fetch_html(input_url).await?;
+        let video_id = extract_vimeo_id_from_page(&html)
+            .context("No Vimeo embed found on that page. \
+                      If the site requires login, open the page in your browser, \
+                      find the Vimeo player URL in the Network tab \
+                      (player.vimeo.com/video/ID), and submit that URL directly.")?;
+        fetch_vimeo_stream(&video_id, None).await?
+    };
 
-    let stream = fetch_vimeo_stream(&video_id).await?;
     let mp3_path = run_ffmpeg(&stream.url, &stream.title, output_dir).await?;
     let duration = probe_duration(&mp3_path).await;
 

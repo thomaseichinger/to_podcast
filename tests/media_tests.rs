@@ -180,3 +180,45 @@ fn test_parse_vimeo_config_no_progressive_returns_error() {
 fn test_parse_vimeo_config_invalid_json_returns_error() {
     assert!(parse_vimeo_config("not json at all").is_err());
 }
+
+// ── Direct Vimeo URL handling (new, TDD red) ──────────────────────────────────
+
+use to_podcast::media::extract_vimeo_from_direct_url;
+
+#[test]
+fn test_direct_vimeo_url_plain() {
+    let r = extract_vimeo_from_direct_url("https://vimeo.com/123456789");
+    assert_eq!(r, Some(("123456789".into(), None)));
+}
+
+#[test]
+fn test_direct_vimeo_player_url() {
+    let r = extract_vimeo_from_direct_url("https://player.vimeo.com/video/987654321");
+    assert_eq!(r, Some(("987654321".into(), None)));
+}
+
+#[test]
+fn test_direct_vimeo_url_with_hash() {
+    let r = extract_vimeo_from_direct_url(
+        "https://player.vimeo.com/video/111222333?h=abc123&autopause=0",
+    );
+    assert_eq!(r, Some(("111222333".into(), Some("abc123".into()))));
+}
+
+#[test]
+fn test_direct_vimeo_url_hash_only_param() {
+    let r = extract_vimeo_from_direct_url("https://player.vimeo.com/video/555?h=xyz");
+    assert_eq!(r, Some(("555".into(), Some("xyz".into()))));
+}
+
+#[test]
+fn test_non_vimeo_url_returns_none() {
+    assert!(extract_vimeo_from_direct_url("https://app.42macro.com/video/foo").is_none());
+    assert!(extract_vimeo_from_direct_url("https://www.youtube.com/watch?v=abc").is_none());
+}
+
+#[test]
+fn test_protocol_relative_direct_vimeo_not_matched() {
+    // protocol-relative URLs are not valid http(s) URLs for direct submission
+    assert!(extract_vimeo_from_direct_url("//player.vimeo.com/video/123").is_none());
+}
