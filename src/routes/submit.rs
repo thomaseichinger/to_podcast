@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::feed::Episode;
-use crate::media::download_and_extract;
+use crate::media::process_url;
 use crate::storage;
 
 #[derive(Deserialize)]
@@ -23,7 +23,6 @@ pub async fn submit_url(
     headers: HeaderMap,
     Json(req): Json<SubmitRequest>,
 ) -> impl IntoResponse {
-    // Extract Bearer token
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -34,12 +33,10 @@ pub async fn submit_url(
         return (StatusCode::UNAUTHORIZED, "Valid session token required").into_response();
     }
 
-    // Validate URL before spawning
     if let Err(e) = crate::media::validate_url(&req.url) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // Process in background so we can immediately return 202
     let url = req.url.clone();
     let pool = state.pool.clone();
     let media_dir = state.config.media_dir.clone();
@@ -47,12 +44,8 @@ pub async fn submit_url(
 
     tokio::spawn(async move {
         let output = std::path::PathBuf::from(&media_dir);
-        let url2 = url.clone();
-        let result = tokio::task::spawn_blocking(move || download_and_extract(&url2, &output))
-            .await;
-
-        match result {
-            Ok(Ok(audio)) => {
+        match process_url(&url, &output).await {
+            Ok(audio) => {
                 let filename = audio
                     .path
                     .file_name()
@@ -72,8 +65,7 @@ pub async fn submit_url(
                     tracing::error!("insert_episode: {e}");
                 }
             }
-            Ok(Err(e)) => tracing::error!("download_and_extract failed: {e}"),
-            Err(e) => tracing::error!("spawn_blocking panicked: {e}"),
+            Err(e) => tracing::error!("process_url failed: {e}"),
         }
     });
 
